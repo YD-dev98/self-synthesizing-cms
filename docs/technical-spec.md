@@ -122,7 +122,7 @@ CREATE INDEX idx_logs_intent ON processing_logs(intent_id);
 
 ### `site_state_history`
 
-Full-surface snapshots taken after each intent run, enabling point-in-time reconstruction of the site. Version numbers are allocated from a database sequence to guarantee uniqueness and monotonic ordering even under concurrent workers.
+Full-surface snapshots taken after each state change (intent processing or TTL sweep), enabling point-in-time reconstruction of the site. Version numbers are allocated from a database sequence to guarantee uniqueness and monotonic ordering even under concurrent workers. `intent_id` is NULL for sweep-only snapshots.
 
 ```sql
 CREATE SEQUENCE site_version_seq START 1;
@@ -145,7 +145,7 @@ CREATE INDEX idx_history_version ON site_state_history(site_version);
 CREATE INDEX idx_history_intent ON site_state_history(intent_id);
 ```
 
-After each intent is processed, the worker calls `nextval('site_version_seq')` once, then snapshots every row in `site_state` into `site_state_history` under that version. The `UNIQUE (site_version, semantic_key)` constraint ensures no duplicate blocks within a snapshot. To reconstruct the site at any point: `SELECT * FROM site_state_history WHERE site_version = N`. No replay logic needed — each version is a complete picture.
+A new version is produced whenever `site_state` changes — whether from intent processing or a TTL sweep. The worker calls `nextval('site_version_seq')` once, then snapshots every row in `site_state` into `site_state_history` under that version. Sweep-only snapshots have `intent_id = NULL`. The `UNIQUE (site_version, semantic_key)` constraint ensures no duplicate blocks within a snapshot. To reconstruct the site at any point: `SELECT * FROM site_state_history WHERE site_version = N`. No replay logic needed — each version is a complete picture.
 
 ## Component Details
 
@@ -214,7 +214,14 @@ Implementation approach:
 Every 5 minutes:
 
   0. SWEEP EXPIRED BLOCKS
-     DELETE FROM site_state WHERE expires_at IS NOT NULL AND expires_at < now()
+     DELETE FROM site_state
+     WHERE expires_at IS NOT NULL AND expires_at < now()
+     RETURNING *;
+
+     If any rows were deleted:
+       → nextval('site_version_seq') to allocate a new version
+       → Snapshot full site_state into site_state_history
+         with intent_id = NULL (system-initiated, not intent-driven)
 
   1. CLAIM PENDING INTENTS (atomic, race-safe)
      WITH claimed AS (
@@ -478,6 +485,221 @@ CRON_INTERVAL_MS=300000          # 5 minutes
 # Access gate (v0)
 ACCESS_PASSWORD=                 # Shared password for intent submission
 ```
+
+## Implementation Phases
+
+Each phase is independently testable. Later phases build on earlier ones but can stub dependencies for isolated testing.
+
+### Test Tooling
+
+| Layer | Tool | Why |
+|---|---|---|
+| Worker unit + integration (schema, queue, mutations) | **Vitest** | Fast, native TypeScript, same runtime as worker code |
+| API routes | **Vitest** + Next.js test helpers | Test route handlers as functions, no browser needed |
+| Frontend components | **Vitest** + **React Testing Library** | Component rendering, Realtime event simulation |
+| Frontend E2E | **Playwright** | Full browser, real Supabase + worker, visual assertions |
+| Schema types | **`tsc --noEmit`** | Compile-time check that Zod schemas produce correct TypeScript types |
+
+All phases 1–5 and 7 use Vitest. Phase 6 uses Vitest for component logic + Playwright for animation/visual tests. Phase 8 is Playwright only (full browser against live services).
+
+### Phase 1 — Database Foundation
+
+Set up all tables, indexes, RLS policies, and the version sequence.
+
+**Deliverables:**
+- `001_initial_schema.sql` migration with all 4 tables + sequence
+- RLS policies: anon can only SELECT on `site_state`, all other tables service-role-only
+
+**Tests:**
+- Migration applies cleanly on a fresh Supabase instance
+- Anon role: SELECT on `site_state` succeeds, INSERT/UPDATE/DELETE rejected
+- Anon role: all operations on `user_intents`, `processing_logs`, `site_state_history` rejected
+- Service role: full CRUD on all tables
+- `site_version_seq` increments correctly across multiple `nextval()` calls
+- `UNIQUE (site_version, semantic_key)` rejects duplicate blocks within a snapshot
+- `UNIQUE (semantic_key)` on `site_state` rejects duplicate keys
+
+---
+
+### Phase 2 — API Layer
+
+Intent submission and status polling routes with access gate.
+
+**Deliverables:**
+- `POST /api/intent` — validates password, inserts intent, returns `{ id }`
+- `GET /api/intent/[id]` — validates password, returns `{ id, status }`
+- Supabase server client using service role key
+
+**Tests:**
+- POST without password → 401
+- POST with wrong password → 401
+- POST with valid password + intent text → 200, returns UUID, row exists in DB with status `pending`
+- POST with empty intent text → 400
+- GET with valid id → returns correct status
+- GET with nonexistent id → 404
+- GET without password → 401
+
+---
+
+### Phase 3 — Worker: Queue Management
+
+Atomic claiming, expired block sweep, and status transitions. No LLM yet — use a passthrough stub that marks intents as completed.
+
+**Deliverables:**
+- Cron entry point (`index.ts`) with configurable interval
+- Expired block sweep query
+- Atomic claim query (CTE + FOR UPDATE SKIP LOCKED)
+- Status transition logic: pending → processing → completed/failed
+
+**Tests:**
+
+*Sweep (Vitest):*
+- Sweep deletes rows where `expires_at < now()`, leaves non-expired rows untouched
+- Sweep that deletes rows → produces a new `site_state_history` snapshot with `intent_id = NULL`
+- Sweep that deletes nothing → no snapshot produced, `site_version_seq` not advanced
+- Sweep snapshot reflects post-deletion state (deleted blocks absent)
+
+*Claiming (Vitest):*
+- Claim returns pending intents ordered by `created_at ASC`, limited to batch size
+- Claimed intents have status `processing` after the query
+- Concurrent claim calls (simulated overlapping workers) never return the same intent
+- Already-processing or completed intents are never claimed
+- Failed intents stay as `failed`, are not re-claimed
+
+---
+
+### Phase 4 — Worker: LLM Integration
+
+Claude API client with agentic tool loop, Zod validation, and self-correction.
+
+**Deliverables:**
+- Claude API client with tool loop (`claude.ts`)
+- Zod schemas with `superRefine` cross-validation (`schema.ts`)
+- Exported inferred types: `MutationResponse`, `UpsertMutation`, `DeleteMutation`
+- Self-correction loop (re-send validation error, up to 3 attempts)
+- Tool call logging to `processing_logs`
+
+**Tests:**
+
+*Typecheck (`tsc --noEmit`):*
+- `schema.ts` compiles with no errors
+- Inferred types (`z.infer<typeof MutationResponseSchema>` etc.) are exported and used by `processor.ts` — a type mismatch between schema and consumer breaks the build
+
+*Schema validation (Vitest, mocked Claude responses, no live API calls):*
+- Valid mutation response → passes Zod, returns parsed mutations
+- Missing `semantic_key` → Zod rejects
+- `semantic_key` prefix doesn't match `block_type` → `superRefine` rejects
+- Invalid topic slug (uppercase, spaces, >40 chars) → Zod rejects
+- Unknown `block_type` → Zod rejects
+- Delete mutation with valid `semantic_key` → passes
+- Delete mutation without `semantic_key` → rejects
+
+*Self-correction (Vitest, mocked):*
+- First response invalid, second valid → succeeds on attempt 2
+- 3 consecutive invalid responses → marks intent `failed`, logs all 3 errors to `processing_logs` with `tool_name: 'schema_validation'`
+
+*Tool loop (Vitest, mocked):*
+- Response with `tool_use` block → executes tool, re-sends, loops until final response
+- Each tool call logged to `processing_logs` with correct `intent_id`, `tool_name`, `tool_input`, `tool_output`
+
+---
+
+### Phase 5 — Worker: State Mutations & History
+
+Apply validated mutations to `site_state` and snapshot to history.
+
+**Deliverables:**
+- Mutation applier: upsert via `ON CONFLICT (semantic_key)`, delete via `semantic_key`
+- TTL stamping per block type (worker-side defaults)
+- History snapshotter (`history.ts`): `nextval` once, bulk insert full `site_state`
+
+**Tests:**
+
+*Mutations (Vitest):*
+- Upsert with new `semantic_key` → INSERT, row exists in `site_state`
+- Upsert with existing `semantic_key` → UPDATE, `updated_at` changes, `created_at` preserved
+- Delete with existing `semantic_key` → row removed from `site_state`
+- Delete with nonexistent `semantic_key` → no error, no-op
+
+*TTL determinism (Vitest, frozen clock via `vi.useFakeTimers`):*
+- `trends` block gets `expires_at` exactly `now() + 24h` — not approximate, assert to the second
+- `weather` block gets `expires_at` exactly `now() + 1h`
+- `summary` block gets `expires_at` exactly `now() + 72h`
+- TTL is derived solely from `block_type`, not from LLM output — a mutation with an `expires_at` field in content is ignored
+- Unknown `block_type` (should never pass validation, but defensively) → throws rather than writing a row with no TTL
+
+*History snapshots (Vitest):*
+- All current `site_state` rows appear in `site_state_history` with same `site_version`
+- `site_version` is consistent across all rows in a batch
+- Two consecutive snapshots have strictly increasing `site_version`
+- Intent-triggered snapshot: `intent_id` is set correctly on all history rows
+- Sweep-triggered snapshot: `intent_id` is NULL on all history rows
+- A cron run that sweeps expired blocks AND processes intents produces two distinct versions (sweep version < intent version)
+
+*Pipeline (Vitest, mocked LLM):*
+- Claim → process → validate → mutate → snapshot → complete — intent ends as `completed` with `result_summary`
+
+---
+
+### Phase 6 — Frontend: Site Surface & Realtime
+
+Render content blocks from `site_state` with live updates and layout-aware transitions.
+
+**Deliverables:**
+- Supabase browser client with Realtime subscription on `site_state`
+- `site-surface.tsx` — queries initial state, subscribes to changes
+- Block components: `trends-block.tsx`, `weather-block.tsx`, `summary-block.tsx`
+- Framer Motion `AnimatePresence` + `layout` wrappers
+
+**Tests:**
+- Initial load: renders all blocks from `site_state` ordered by `display_order`
+- Empty state: shows prompt text and magic bar only
+- Realtime INSERT → new block appears in correct position
+- Realtime UPDATE → block content updates in place
+- Realtime DELETE → block removed from surface
+- Block type routing: `trends` data renders trends component, `weather` renders weather, etc.
+- Layout animation: insert triggers fade-in + expand (visual/snapshot test)
+- Layout animation: removal triggers collapse + fade-out
+- Layout animation: reorder triggers positional transition
+
+---
+
+### Phase 7 — Frontend: Magic Bar & Access Gate
+
+User intent input with password protection.
+
+**Deliverables:**
+- `access-gate.tsx` — modal that prompts for password, stores in cookie on success
+- `magic-bar.tsx` — fixed-bottom input, POSTs to `/api/intent`, shows confirmation
+- Status polling: after submit, polls `GET /api/intent/[id]` until completed/failed
+
+**Tests:**
+- Gate blocks magic bar until valid password entered
+- Invalid password shows error, does not store cookie
+- Valid password stores cookie, gate dismissed, persists across reload
+- Submit intent: POST fires with correct headers and body
+- Confirmation message shown after successful submit
+- Polling: status transitions from `pending` → `processing` → `completed` reflected in UI
+- Empty input: submit button disabled or submission prevented
+
+---
+
+### Phase 8 — End-to-End Integration
+
+Full loop verification with live Claude API.
+
+**Deliverables:**
+- Integration test script that runs the complete flow
+- Manual test checklist
+
+**Tests:**
+- Type "show me AI trends" → intent created → worker claims → Claude searches + fetches → mutations validated → `site_state` updated → Realtime pushes to frontend → trends block renders
+- Type "show the weather in Stockholm" → weather block appears with live data
+- Type "remove the weather" → weather block deleted from surface
+- Second intent reusing same `semantic_key` → block updated, not duplicated
+- After processing: `site_state_history` contains correct versioned snapshot
+- Expired block disappears after TTL + next cron sweep
+- Two intents submitted before cron runs → both processed in single run, in order
 
 ## V0 Scope Boundaries
 

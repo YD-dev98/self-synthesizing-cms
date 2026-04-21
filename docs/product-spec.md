@@ -61,7 +61,7 @@ The system maintains a complete, reconstructable history of the site's evolution
 - **Tool audit trail** — Every web search, fetch, and validation attempt is logged in `processing_logs`, showing *how the system reasoned*.
 - **Versioned snapshots** — After each intent is processed, a full snapshot of the site surface is captured in `site_state_history` under a monotonic version number. This means you can reconstruct exactly what the site looked like at any point in its evolution: `SELECT * FROM site_state_history WHERE site_version = N`.
 
-The version number ties the snapshot to the intent that produced it, so you can trace the full chain: intent #12 triggered version #12, which changed the site from version #11 by adding a weather block and updating a trends card.
+Each snapshot records which intent produced it. You can trace the full chain: intent `abc-def` produced site version `n`, which changed the site from version `n-1` — for example by adding a weather block and updating a trends card. Intent IDs and site versions are independent sequences (UUIDs vs. integers), linked through the `intent_id` foreign key on each snapshot.
 
 ## V0 Success Criteria
 
