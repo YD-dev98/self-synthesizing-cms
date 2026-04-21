@@ -59,9 +59,9 @@ The system maintains a complete, reconstructable history of the site's evolution
 
 - **Intent log** — Every user request is recorded in `user_intents` with its processing outcome, forming the narrative of *what was asked*.
 - **Tool audit trail** — Every web search, fetch, and validation attempt is logged in `processing_logs`, showing *how the system reasoned*.
-- **Versioned snapshots** — After each intent is processed, a full snapshot of the site surface is captured in `site_state_history` under a monotonic version number. This means you can reconstruct exactly what the site looked like at any point in its evolution: `SELECT * FROM site_state_history WHERE site_version = N`.
+- **Versioned snapshots** — Every time `site_state` changes — whether from intent processing or a TTL expiry sweep — a full snapshot of the site surface is captured in `site_state_history` under a monotonic version number. This means you can reconstruct exactly what the site looked like at any point in its evolution: `SELECT * FROM site_state_history WHERE site_version = N`.
 
-Each snapshot records which intent produced it. You can trace the full chain: intent `abc-def` produced site version `n`, which changed the site from version `n-1` — for example by adding a weather block and updating a trends card. Intent IDs and site versions are independent sequences (UUIDs vs. integers), linked through the `intent_id` foreign key on each snapshot.
+Intent-driven snapshots link back to the intent via `intent_id`. System-initiated snapshots (e.g. expired blocks removed by TTL sweep) have `intent_id = NULL`. You can trace the full chain: intent `abc-def` produced site version `n`, which changed the site from version `n-1` — for example by adding a weather block and updating a trends card. Or version `n` has no intent, meaning the system swept stale content. Intent IDs and site versions are independent sequences (UUIDs vs. integers), linked through the `intent_id` foreign key on each snapshot.
 
 ## V0 Success Criteria
 
