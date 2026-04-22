@@ -53,6 +53,8 @@
 | Layer              | Technology                    |
 |--------------------|-------------------------------|
 | Frontend           | Next.js (App Router)          |
+| UI Components      | shadcn/ui + Tailwind CSS      |
+| Animations         | Framer Motion                 |
 | Hosting            | Vercel                        |
 | Database           | Supabase Postgres             |
 | Realtime           | Supabase Realtime             |
@@ -151,10 +153,10 @@ A new version is produced whenever `site_state` changes — whether from intent 
 
 ### 1. Magic Bar (Frontend)
 
-- Fixed-position input at viewport bottom
+- Fixed-position input at viewport bottom using shadcn/ui `Input` + `Button`
 - On submit: POST to `/api/intent` server route (not direct DB insert)
-- Shows subtle confirmation ("Intent queued — site will evolve shortly")
-- Gated behind a session password for v0 (simple modal on first visit)
+- Shows subtle confirmation via shadcn/ui `Sonner` toast ("Intent queued — site will evolve shortly")
+- Gated behind a session password for v0 (shadcn/ui `Dialog` modal on first visit)
 
 **Access gate (v0):**
 
@@ -186,10 +188,11 @@ The anon role can only SELECT on `site_state` (for Realtime subscriptions and in
 - Queries `site_state` ordered by `display_order`
 - Subscribes to Supabase Realtime on `site_state` table
 - When new/updated rows arrive, UI morphs without page reload
-- Each `block_type` maps to a React component:
-  - `trends` → card grid with title, summary, key points, sources
-  - `weather` → weather display widget
-  - `summary` → general text block
+- Each `block_type` maps to a React component built with shadcn/ui primitives:
+  - `trends` → `Card` grid with title, summary, key points, sources using `Badge`, `Separator`
+  - `weather` → `Card` with weather data display
+  - `summary` → `Card` with general text block
+- All styling via Tailwind CSS utility classes — no custom CSS beyond globals
 - Empty state: minimal landing with just the magic bar and a prompt
 
 **Layout-aware transitions:**
