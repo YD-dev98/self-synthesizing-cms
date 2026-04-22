@@ -1,5 +1,9 @@
 {
   "name": "self-synthesizing-cms",
   "private": true,
-  "workspaces": ["web", "worker"]
+  "workspaces": ["web", "worker"],
+  "scripts": {
+    "test": "npm test --workspace=worker && npm test --workspace=web",
+    "test:watch": "npm run test:watch --workspace=worker"
+  }
 }
