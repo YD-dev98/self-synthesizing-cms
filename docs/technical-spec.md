@@ -122,17 +122,28 @@ CREATE TABLE processing_logs (
 CREATE INDEX idx_logs_intent ON processing_logs(intent_id);
 ```
 
-### `site_state_history`
+### `site_versions`
 
-Full-surface snapshots taken after each state change (intent processing or TTL sweep), enabling point-in-time reconstruction of the site. Version numbers are allocated from a database sequence to guarantee uniqueness and monotonic ordering even under concurrent workers. `intent_id` is NULL for sweep-only snapshots.
+Version registry — one row per snapshot, even if the site surface is empty. This makes empty surfaces distinguishable from nonexistent versions.
 
 ```sql
 CREATE SEQUENCE site_version_seq START 1;
 
+CREATE TABLE site_versions (
+  version INTEGER PRIMARY KEY,
+  intent_id UUID REFERENCES user_intents(id),  -- NULL for system-initiated (e.g. TTL sweep)
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### `site_state_history`
+
+Block-level snapshot data, keyed to a version. Zero rows for a given version means the surface was empty at that point.
+
+```sql
 CREATE TABLE site_state_history (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  site_version INTEGER NOT NULL,            -- worker calls nextval('site_version_seq') once per run, passes explicitly
-  intent_id UUID REFERENCES user_intents(id),
+  site_version INTEGER NOT NULL REFERENCES site_versions(version),
   semantic_key TEXT NOT NULL,
   block_type TEXT NOT NULL,
   title TEXT,
@@ -144,10 +155,14 @@ CREATE TABLE site_state_history (
 );
 
 CREATE INDEX idx_history_version ON site_state_history(site_version);
-CREATE INDEX idx_history_intent ON site_state_history(intent_id);
+CREATE INDEX idx_versions_intent ON site_versions(intent_id);
 ```
 
-A new version is produced whenever `site_state` changes — whether from intent processing or a TTL sweep. The worker calls `nextval('site_version_seq')` once, then snapshots every row in `site_state` into `site_state_history` under that version. Sweep-only snapshots have `intent_id = NULL`. The `UNIQUE (site_version, semantic_key)` constraint ensures no duplicate blocks within a snapshot. To reconstruct the site at any point: `SELECT * FROM site_state_history WHERE site_version = N`. No replay logic needed — each version is a complete picture.
+A new version is produced whenever `site_state` changes — whether from intent processing or a TTL sweep. The worker writes a row to `site_versions` first, then inserts the block rows into `site_state_history` (which may be zero for an empty surface). To check if a version exists: query `site_versions`. To reconstruct the site: `SELECT * FROM site_state_history WHERE site_version = N`. An empty result with an existing version means the surface was intentionally empty.
+
+**Sweep path is fully atomic** — the `sweep_expired_blocks()` Postgres function acquires an advisory lock (`pg_advisory_xact_lock(42)`), deletes expired rows, allocates a version, registers it in `site_versions`, and snapshots surviving blocks into `site_state_history` — all in a single transaction. No JS round trips between the steps.
+
+**State mutation lock convention:** Every Postgres function that mutates `site_state` and/or writes to `site_versions` + `site_state_history` must acquire `pg_advisory_xact_lock(42)` at the start. This serializes all state writers so snapshots are always consistent. Phase 5's `apply_mutations_and_snapshot()` RPC must use the same lock ID.
 
 ## Component Details
 
@@ -213,18 +228,17 @@ Implementation approach:
 
 ### 3. Background Worker
 
+Worker uses recursive setTimeout (not setInterval) to guarantee the previous tick
+completes before the next one is scheduled. No overlapping ticks.
+
 ```
-Every 5 minutes:
+Every 5 minutes (sequential, non-overlapping):
 
-  0. SWEEP EXPIRED BLOCKS
-     DELETE FROM site_state
-     WHERE expires_at IS NOT NULL AND expires_at < now()
-     RETURNING *;
-
-     If any rows were deleted:
-       → nextval('site_version_seq') to allocate a new version
-       → Snapshot full site_state into site_state_history
-         with intent_id = NULL (system-initiated, not intent-driven)
+  0. SWEEP EXPIRED BLOCKS (single atomic RPC: sweep_expired_blocks())
+     In one Postgres transaction:
+       → DELETE expired rows from site_state
+       → If any deleted: nextval → INSERT site_versions → INSERT site_state_history
+     Returns count of deleted rows. Zero = no-op, no version allocated.
 
   1. CLAIM PENDING INTENTS (atomic, race-safe)
      WITH claimed AS (
@@ -253,14 +267,14 @@ Every 5 minutes:
         - Upsert: INSERT ... ON CONFLICT (semantic_key) DO UPDATE
         - Delete: DELETE WHERE semantic_key = ...
         - Worker stamps expires_at using TTL defaults per block_type
-     f. Snapshot: INSERT full site_state into site_state_history
-        with new site_version and intent_id
+     f. Snapshot: nextval → INSERT site_versions (with intent_id)
+        → INSERT full site_state into site_state_history
      g. UPDATE intent: status = 'completed', result_summary = ...
 
   3. On error: UPDATE status = 'failed', error = message
 ```
 
-The `FOR UPDATE SKIP LOCKED` CTE ensures that if two worker runs overlap, the second one skips any rows the first is still holding — no double-processing, no blocking.
+The `FOR UPDATE SKIP LOCKED` CTE ensures that if two worker runs overlap, the second one skips any rows the first is still holding — no double-processing, no blocking. However, the worker uses recursive `setTimeout` (not `setInterval`) so ticks never overlap in practice.
 
 ### 4. Claude API Integration
 
@@ -435,17 +449,20 @@ self-synthesizing-cms/
 │   └── next.config.js
 ├── worker/                     # Background worker
 │   ├── src/
-│   │   ├── index.ts            # Cron entry point
-│   │   ├── processor.ts        # Intent processing logic
-│   │   ├── claude.ts           # Claude API client + tool loop
-│   │   ├── tools.ts            # Tool definitions
-│   │   ├── schema.ts           # Zod schemas + block type registry
-│   │   └── history.ts          # Site state snapshotting
+│   │   ├── index.ts            # Entrypoint: config + recursive setTimeout loop
+│   │   ├── tick.ts             # Single worker tick: sweep → claim → process
+│   │   ├── sweep.ts            # Calls atomic sweep_expired_blocks() RPC
+│   │   ├── claim.ts            # Calls atomic claim_pending_intents() RPC
+│   │   ├── supabase.ts         # Service role client factory
+│   │   ├── processor.ts        # Intent processing logic (Phase 4+)
+│   │   ├── claude.ts           # Claude API client + tool loop (Phase 4+)
+│   │   ├── tools.ts            # Tool definitions (Phase 4+)
+│   │   └── schema.ts           # Zod schemas + block type registry (Phase 4+)
 │   ├── package.json
 │   └── tsconfig.json
 ├── supabase/
 │   └── migrations/
-│       └── 001_initial_schema.sql  # All 4 tables + indexes + RLS policies
+│       └── 001_initial_schema.sql  # 5 tables + sequence + RLS + RPCs (sweep, claim, nextval)
 └── package.json                    # Root workspace
 ```
 
@@ -558,16 +575,24 @@ Atomic claiming, expired block sweep, and status transitions. No LLM yet — use
 
 *Sweep (Vitest):*
 - Sweep deletes rows where `expires_at < now()`, leaves non-expired rows untouched
-- Sweep that deletes rows → produces a new `site_state_history` snapshot with `intent_id = NULL`
-- Sweep that deletes nothing → no snapshot produced, `site_version_seq` not advanced
+- Sweep that deletes rows → produces a `site_versions` entry (with NULL `intent_id`) and `site_state_history` snapshot
+- Sweep that deletes nothing → no version allocated, no snapshot
 - Sweep snapshot reflects post-deletion state (deleted blocks absent)
+- Sweep that deletes the last block → version exists in `site_versions`, zero rows in `site_state_history` (valid empty surface)
 
 *Claiming (Vitest):*
-- Claim returns pending intents ordered by `created_at ASC`, limited to batch size
+- Claim returns oldest pending intents first when batch is limited
 - Claimed intents have status `processing` after the query
 - Concurrent claim calls (simulated overlapping workers) never return the same intent
 - Already-processing or completed intents are never claimed
 - Failed intents stay as `failed`, are not re-claimed
+
+*Tick status transitions (Vitest):*
+- Pending intent → processing → completed with `result_summary` after tick
+- Processing is visible in DB during claim
+- Multiple intents processed in one tick
+- Tick is a no-op when no pending intents
+- Completed and failed intents are not re-processed
 
 ---
 
@@ -612,9 +637,8 @@ Claude API client with agentic tool loop, Zod validation, and self-correction.
 Apply validated mutations to `site_state` and snapshot to history.
 
 **Deliverables:**
-- Mutation applier: upsert via `ON CONFLICT (semantic_key)`, delete via `semantic_key`
-- TTL stamping per block type (worker-side defaults)
-- History snapshotter (`history.ts`): `nextval` once, bulk insert full `site_state`
+- Atomic `apply_mutations_and_snapshot()` Postgres RPC: acquires `pg_advisory_xact_lock(42)`, applies upserts/deletes to `site_state`, stamps TTL per block type, allocates version in `site_versions`, snapshots to `site_state_history` — single transaction
+- JS-side caller in worker that invokes the RPC with validated mutations + intent ID
 
 **Tests:**
 
@@ -635,8 +659,9 @@ Apply validated mutations to `site_state` and snapshot to history.
 - All current `site_state` rows appear in `site_state_history` with same `site_version`
 - `site_version` is consistent across all rows in a batch
 - Two consecutive snapshots have strictly increasing `site_version`
-- Intent-triggered snapshot: `intent_id` is set correctly on all history rows
-- Sweep-triggered snapshot: `intent_id` is NULL on all history rows
+- Intent-triggered snapshot: `site_versions` row has correct `intent_id`
+- Sweep-triggered snapshot: `site_versions` row has `intent_id = NULL`
+- Empty surface after mutation: `site_versions` row exists, zero rows in `site_state_history`
 - A cron run that sweeps expired blocks AND processes intents produces two distinct versions (sweep version < intent version)
 
 *Pipeline (Vitest, mocked LLM):*

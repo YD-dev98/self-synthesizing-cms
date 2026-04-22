@@ -7,8 +7,10 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0"
+  },
   "devDependencies": {
-    "@supabase/supabase-js": "^2.49.0",
     "vitest": "^3.2.1",
     "typescript": "^5.8.0"
   }

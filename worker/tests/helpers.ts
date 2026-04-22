@@ -24,6 +24,7 @@ export function serviceClient(): SupabaseClient {
 export async function cleanAll(client: SupabaseClient): Promise<void> {
   // Order matters: respect foreign keys
   await client.from("site_state_history").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+  await client.from("site_versions").delete().neq("version", -1);
   await client.from("processing_logs").delete().neq("id", "00000000-0000-0000-0000-000000000000");
   await client.from("site_state").delete().neq("id", "00000000-0000-0000-0000-000000000000");
   await client.from("user_intents").delete().neq("id", "00000000-0000-0000-0000-000000000000");

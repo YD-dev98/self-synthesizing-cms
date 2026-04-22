@@ -93,6 +93,18 @@ describe("RLS — anon role", () => {
     expect(error).not.toBeNull();
   });
 
+  it("cannot SELECT from site_versions", async () => {
+    const { data } = await anon.from("site_versions").select("*");
+    expect(data).toHaveLength(0);
+  });
+
+  it("cannot INSERT into site_versions", async () => {
+    const { error } = await anon.from("site_versions").insert({
+      version: 1,
+    });
+    expect(error).not.toBeNull();
+  });
+
   it("cannot SELECT from site_state_history", async () => {
     const { data } = await anon.from("site_state_history").select("*");
     expect(data).toHaveLength(0);
@@ -189,7 +201,29 @@ describe("RLS — service role", () => {
     expect(deleteErr).toBeNull();
   });
 
+  it("has full CRUD on site_versions", async () => {
+    const { error: insertErr } = await service
+      .from("site_versions")
+      .insert({ version: 900 });
+    expect(insertErr).toBeNull();
+
+    const { data: selected } = await service
+      .from("site_versions")
+      .select("*")
+      .eq("version", 900);
+    expect(selected).toHaveLength(1);
+
+    const { error: deleteErr } = await service
+      .from("site_versions")
+      .delete()
+      .eq("version", 900);
+    expect(deleteErr).toBeNull();
+  });
+
   it("has full CRUD on site_state_history", async () => {
+    // site_state_history has FK to site_versions
+    await service.from("site_versions").insert({ version: 999 });
+
     const { data: inserted, error: insertErr } = await service
       .from("site_state_history")
       .insert({
@@ -235,6 +269,8 @@ describe("Constraints", () => {
   });
 
   it("rejects duplicate (site_version, semantic_key) in site_state_history", async () => {
+    await service.from("site_versions").insert({ version: 1 });
+
     await service.from("site_state_history").insert({
       site_version: 1,
       semantic_key: "trends:ai",
@@ -255,6 +291,11 @@ describe("Constraints", () => {
   });
 
   it("allows same semantic_key in different site_versions", async () => {
+    await service.from("site_versions").insert([
+      { version: 1 },
+      { version: 2 },
+    ]);
+
     const { error: e1 } = await service.from("site_state_history").insert({
       site_version: 1,
       semantic_key: "trends:ai",
@@ -275,6 +316,7 @@ describe("Constraints", () => {
   });
 
   it("rejects invalid block_type in site_state_history", async () => {
+    await service.from("site_versions").insert({ version: 100 });
     const { error } = await service.from("site_state_history").insert({
       site_version: 100,
       semantic_key: "unknown:test",
@@ -287,8 +329,9 @@ describe("Constraints", () => {
   });
 
   it("rejects mismatched semantic_key prefix in site_state_history", async () => {
+    await service.from("site_versions").insert({ version: 101 });
     const { error } = await service.from("site_state_history").insert({
-      site_version: 100,
+      site_version: 101,
       semantic_key: "weather:stockholm",
       block_type: "trends",
       content: {},
@@ -299,8 +342,9 @@ describe("Constraints", () => {
   });
 
   it("rejects invalid slug format in site_state_history", async () => {
+    await service.from("site_versions").insert({ version: 102 });
     const { error } = await service.from("site_state_history").insert({
-      site_version: 100,
+      site_version: 102,
       semantic_key: "trends:AI-Industry",
       block_type: "trends",
       content: {},
@@ -308,6 +352,18 @@ describe("Constraints", () => {
     });
     expect(error).not.toBeNull();
     expect(error!.code).toBe("23514");
+  });
+
+  it("rejects site_state_history row without site_versions entry", async () => {
+    const { error } = await service.from("site_state_history").insert({
+      site_version: 9999,
+      semantic_key: "trends:orphan",
+      block_type: "trends",
+      content: {},
+      display_order: 0,
+    });
+    expect(error).not.toBeNull();
+    expect(error!.code).toBe("23503"); // foreign_key_violation
   });
 
   it("rejects invalid status values on user_intents", async () => {

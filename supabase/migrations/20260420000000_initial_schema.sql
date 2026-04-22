@@ -61,10 +61,17 @@ CREATE INDEX idx_logs_intent ON processing_logs(intent_id);
 -- Versioned full-surface snapshots for point-in-time reconstruction
 CREATE SEQUENCE site_version_seq START 1;
 
+-- Version registry — one row per snapshot, even if the surface is empty
+CREATE TABLE site_versions (
+  version INTEGER PRIMARY KEY,
+  intent_id UUID REFERENCES user_intents(id),  -- NULL for system-initiated (e.g. TTL sweep)
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Block-level snapshot data, keyed to a version
 CREATE TABLE site_state_history (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  site_version INTEGER NOT NULL,
-  intent_id UUID REFERENCES user_intents(id),
+  site_version INTEGER NOT NULL REFERENCES site_versions(version),
   semantic_key TEXT NOT NULL,
   block_type TEXT NOT NULL,
   title TEXT,
@@ -82,7 +89,7 @@ CREATE TABLE site_state_history (
 );
 
 CREATE INDEX idx_history_version ON site_state_history(site_version);
-CREATE INDEX idx_history_intent ON site_state_history(intent_id);
+CREATE INDEX idx_versions_intent ON site_versions(intent_id);
 
 -- 2. Row Level Security
 -- ---------------------------------------------------------
@@ -90,6 +97,7 @@ CREATE INDEX idx_history_intent ON site_state_history(intent_id);
 ALTER TABLE user_intents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE site_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE processing_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE site_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE site_state_history ENABLE ROW LEVEL SECURITY;
 
 -- Anon: can only read site_state (for Realtime subscriptions + initial page load)
@@ -118,6 +126,86 @@ $$;
 REVOKE ALL ON FUNCTION nextval_site_version() FROM public;
 REVOKE ALL ON FUNCTION nextval_site_version() FROM anon;
 GRANT EXECUTE ON FUNCTION nextval_site_version() TO service_role;
+
+-- Atomically claim pending intents (CTE + FOR UPDATE SKIP LOCKED)
+CREATE OR REPLACE FUNCTION claim_pending_intents(batch_size integer DEFAULT 5)
+RETURNS SETOF user_intents
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+  WITH claimed AS (
+    SELECT id FROM user_intents
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT batch_size
+    FOR UPDATE SKIP LOCKED
+  )
+  UPDATE user_intents
+  SET status = 'processing', processed_at = now()
+  FROM claimed
+  WHERE user_intents.id = claimed.id
+  RETURNING user_intents.*;
+$$;
+
+REVOKE ALL ON FUNCTION claim_pending_intents(integer) FROM public;
+REVOKE ALL ON FUNCTION claim_pending_intents(integer) FROM anon;
+GRANT EXECUTE ON FUNCTION claim_pending_intents(integer) TO service_role;
+
+-- *** SITE STATE MUTATION LOCK ***
+-- All functions that mutate site_state and/or snapshot to site_state_history
+-- MUST acquire this advisory lock at the start of their transaction.
+-- This serializes state writers so snapshots are always consistent.
+-- Lock ID: 42 (arbitrary constant, shared across all mutation RPCs).
+-- Phase 5's apply_mutations_and_snapshot() must use the same lock.
+
+-- Atomic sweep: delete expired blocks and snapshot in one transaction.
+-- Returns the number of expired blocks deleted (0 means no-op, no snapshot).
+CREATE OR REPLACE FUNCTION sweep_expired_blocks()
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  deleted_count integer;
+  new_version integer;
+BEGIN
+  -- Serialize against other state writers (sweep, future mutation RPCs)
+  PERFORM pg_advisory_xact_lock(42);
+
+  -- Delete expired blocks
+  WITH deleted AS (
+    DELETE FROM site_state
+    WHERE expires_at IS NOT NULL AND expires_at < now()
+    RETURNING *
+  )
+  SELECT count(*) INTO deleted_count FROM deleted;
+
+  -- Only snapshot if something changed
+  IF deleted_count = 0 THEN
+    RETURN 0;
+  END IF;
+
+  -- Allocate version
+  new_version := nextval('site_version_seq');
+
+  -- Register the version (intent_id NULL = system sweep)
+  INSERT INTO site_versions (version, intent_id)
+  VALUES (new_version, NULL);
+
+  -- Snapshot surviving blocks (may be zero rows — that's valid)
+  INSERT INTO site_state_history
+    (site_version, semantic_key, block_type, title, content, display_order, expires_at)
+  SELECT
+    new_version, semantic_key, block_type, title, content, display_order, expires_at
+  FROM site_state;
+
+  RETURN deleted_count;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION sweep_expired_blocks() FROM public;
+REVOKE ALL ON FUNCTION sweep_expired_blocks() FROM anon;
+GRANT EXECUTE ON FUNCTION sweep_expired_blocks() TO service_role;
 
 -- Check if site_state is in the realtime publication (for testing)
 CREATE OR REPLACE FUNCTION check_realtime_publication()
