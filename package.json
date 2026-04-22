@@ -1,0 +1,5 @@
+{
+  "name": "self-synthesizing-cms",
+  "private": true,
+  "workspaces": ["web", "worker"]
+}
