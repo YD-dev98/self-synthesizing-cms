@@ -415,7 +415,7 @@ If validation fails, the worker enters a **self-correction loop**:
 1. Send the Zod error back to Claude along with the original intent and the invalid response
 2. Claude attempts to fix its output
 3. Re-validate the corrected response
-4. Up to **3 attempts** — if all fail, mark the intent as `failed` and log the validation errors to `processing_logs` with `tool_name: 'schema_validation'`
+4. Up to **3 attempts** — if all fail, log the validation errors to `processing_logs` with `tool_name: 'schema_validation'` and throw so the worker tick can mark the intent as `failed`
 
 This keeps the site state clean while giving the LLM a chance to recover from structural mistakes.
 
@@ -456,7 +456,7 @@ self-synthesizing-cms/
 │   │   ├── supabase.ts         # Service role client factory
 │   │   ├── processor.ts        # Intent processing logic (Phase 4+)
 │   │   ├── claude.ts           # Claude API client + tool loop (Phase 4+)
-│   │   ├── tools.ts            # Tool definitions (Phase 4+)
+│   │   ├── mutate.ts           # Calls apply_mutations_and_snapshot() RPC (Phase 5+)
 │   │   └── schema.ts           # Zod schemas + block type registry (Phase 4+)
 │   ├── package.json
 │   └── tsconfig.json
@@ -624,7 +624,7 @@ Claude API client with agentic tool loop, Zod validation, and self-correction.
 
 *Self-correction (Vitest, mocked):*
 - First response invalid, second valid → succeeds on attempt 2
-- 3 consecutive invalid responses → marks intent `failed`, logs all 3 errors to `processing_logs` with `tool_name: 'schema_validation'`
+- 3 consecutive invalid responses → `processIntent()` throws, logs all 3 errors to `processing_logs` with `tool_name: 'schema_validation'`, and the worker tick marks the intent `failed`
 
 *Tool loop (Vitest, mocked):*
 - Response with `tool_use` block → executes tool, re-sends, loops until final response
@@ -637,8 +637,8 @@ Claude API client with agentic tool loop, Zod validation, and self-correction.
 Apply validated mutations to `site_state` and snapshot to history.
 
 **Deliverables:**
-- Atomic `apply_mutations_and_snapshot()` Postgres RPC: acquires `pg_advisory_xact_lock(42)`, applies upserts/deletes to `site_state`, stamps TTL per block type, allocates version in `site_versions`, snapshots to `site_state_history` — single transaction
-- JS-side caller in worker that invokes the RPC with validated mutations + intent ID
+- Atomic `apply_mutations_and_snapshot()` Postgres RPC: acquires `pg_advisory_xact_lock(42)`, applies upserts/deletes to `site_state`, stamps TTL per block type, allocates version in `site_versions`, snapshots to `site_state_history`, and marks the intent `completed` with `result_summary` — single transaction
+- JS-side caller in worker that invokes the RPC with validated mutations, intent ID, and result summary
 
 **Tests:**
 
@@ -648,10 +648,10 @@ Apply validated mutations to `site_state` and snapshot to history.
 - Delete with existing `semantic_key` → row removed from `site_state`
 - Delete with nonexistent `semantic_key` → no error, no-op
 
-*TTL determinism (Vitest, frozen clock via `vi.useFakeTimers`):*
-- `trends` block gets `expires_at` exactly `now() + 24h` — not approximate, assert to the second
-- `weather` block gets `expires_at` exactly `now() + 1h`
-- `summary` block gets `expires_at` exactly `now() + 72h`
+*TTL determinism (Vitest):*
+- `trends` block gets `expires_at` approximately `created_at + 24h`
+- `weather` block gets `expires_at` approximately `created_at + 1h`
+- `summary` block gets `expires_at` approximately `created_at + 72h`
 - TTL is derived solely from `block_type`, not from LLM output — a mutation with an `expires_at` field in content is ignored
 - Unknown `block_type` (should never pass validation, but defensively) → throws rather than writing a row with no TTL
 
