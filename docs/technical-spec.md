@@ -263,13 +263,13 @@ Every 5 minutes (sequential, non-overlapping):
      b. Execute Claude response (agentic tool loop)
      c. Log each tool call to processing_logs
      d. Validate + self-correct mutation response (up to 3 attempts)
-     e. Apply mutations to site_state:
-        - Upsert: INSERT ... ON CONFLICT (semantic_key) DO UPDATE
-        - Delete: DELETE WHERE semantic_key = ...
-        - Worker stamps expires_at using TTL defaults per block_type
-     f. Snapshot: nextval → INSERT site_versions (with intent_id)
-        → INSERT full site_state into site_state_history
-     g. UPDATE intent: status = 'completed', result_summary = ...
+     e. Single atomic RPC: apply_mutations_and_snapshot()
+        - Acquires pg_advisory_xact_lock(42)
+        - Upserts/deletes on site_state with TTL stamps per block_type
+        - Allocates version → INSERT site_versions (with intent_id)
+        - Snapshots full site_state into site_state_history
+        - Marks intent as completed with result_summary
+        (All in one Postgres transaction — no split requests)
 
   3. On error: UPDATE status = 'failed', error = message
 ```

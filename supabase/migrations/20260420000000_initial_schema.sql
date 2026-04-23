@@ -158,6 +158,111 @@ GRANT EXECUTE ON FUNCTION claim_pending_intents(integer) TO service_role;
 -- Lock ID: 42 (arbitrary constant, shared across all mutation RPCs).
 -- Phase 5's apply_mutations_and_snapshot() must use the same lock.
 
+-- Atomic apply mutations and snapshot in one transaction.
+-- Accepts a JSONB array of mutations and an intent UUID.
+-- Each mutation: { action: "upsert"|"delete", semantic_key, block_type?, title?, content?, display_order? }
+-- TTL is stamped server-side based on block_type (trends=24h, weather=1h, summary=72h).
+-- Returns the allocated site_version number.
+CREATE OR REPLACE FUNCTION apply_mutations_and_snapshot(
+  mutations JSONB,
+  p_intent_id UUID,
+  p_result_summary TEXT DEFAULT NULL
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  new_version integer;
+  mut JSONB;
+  mut_action text;
+  mut_key text;
+  mut_block_type text;
+  mut_ttl interval;
+BEGIN
+  -- Serialize against other state writers
+  PERFORM pg_advisory_xact_lock(42);
+
+  -- Apply each mutation
+  FOR mut IN SELECT * FROM jsonb_array_elements(mutations)
+  LOOP
+    mut_action := mut->>'action';
+    mut_key := mut->>'semantic_key';
+
+    IF mut_action = 'upsert' THEN
+      mut_block_type := mut->>'block_type';
+
+      -- Determine TTL from block_type
+      mut_ttl := CASE mut_block_type
+        WHEN 'trends'  THEN interval '24 hours'
+        WHEN 'weather' THEN interval '1 hour'
+        WHEN 'summary' THEN interval '72 hours'
+        ELSE NULL
+      END;
+
+      IF mut_ttl IS NULL THEN
+        RAISE EXCEPTION 'Unknown block_type: %', mut_block_type;
+      END IF;
+
+      INSERT INTO site_state (
+        semantic_key, block_type, title, content, display_order,
+        source_intent_id, expires_at, updated_at
+      ) VALUES (
+        mut_key,
+        mut_block_type,
+        mut->>'title',
+        (mut->'content')::jsonb,
+        (mut->>'display_order')::integer,
+        p_intent_id,
+        now() + mut_ttl,
+        now()
+      )
+      ON CONFLICT (semantic_key) DO UPDATE SET
+        block_type = EXCLUDED.block_type,
+        title = EXCLUDED.title,
+        content = EXCLUDED.content,
+        display_order = EXCLUDED.display_order,
+        source_intent_id = EXCLUDED.source_intent_id,
+        expires_at = now() + mut_ttl,
+        updated_at = now();
+
+    ELSIF mut_action = 'delete' THEN
+      DELETE FROM site_state WHERE semantic_key = mut_key;
+
+    ELSE
+      RAISE EXCEPTION 'Unknown mutation action: %', mut_action;
+    END IF;
+  END LOOP;
+
+  -- Allocate version
+  new_version := nextval('site_version_seq');
+
+  -- Register version
+  INSERT INTO site_versions (version, intent_id)
+  VALUES (new_version, p_intent_id);
+
+  -- Snapshot full site_state (may be zero rows)
+  INSERT INTO site_state_history
+    (site_version, semantic_key, block_type, title, content, display_order, expires_at)
+  SELECT
+    new_version, semantic_key, block_type, title, content, display_order, expires_at
+  FROM site_state;
+
+  -- Mark intent as completed (atomic with mutations + snapshot)
+  UPDATE user_intents
+  SET status = 'completed',
+      result_summary = p_result_summary,
+      processed_at = now()
+  WHERE id = p_intent_id;
+
+  RETURN new_version;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION apply_mutations_and_snapshot(JSONB, UUID, TEXT) FROM public;
+REVOKE ALL ON FUNCTION apply_mutations_and_snapshot(JSONB, UUID, TEXT) FROM anon;
+GRANT EXECUTE ON FUNCTION apply_mutations_and_snapshot(JSONB, UUID, TEXT) TO service_role;
+
 -- Atomic sweep: delete expired blocks and snapshot in one transaction.
 -- Returns the number of expired blocks deleted (0 means no-op, no snapshot).
 CREATE OR REPLACE FUNCTION sweep_expired_blocks()
