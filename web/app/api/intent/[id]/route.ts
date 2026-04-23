@@ -1,13 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServiceClient } from "@/lib/supabase-server";
+import {
+  clearAccessSessionCookie,
+  hasAccessSession,
+} from "@/lib/access-session";
 
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const token = request.headers.get("x-access-token");
-  if (!token || token !== process.env.ACCESS_PASSWORD) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  if (!hasAccessSession(request)) {
+    const response = NextResponse.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+    clearAccessSessionCookie(response);
+    return response;
   }
 
   const { id } = await params;

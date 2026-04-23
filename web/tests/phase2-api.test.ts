@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import { NextRequest } from "next/server";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { POST } from "@/app/api/intent/route";
-import { GET } from "@/app/api/intent/[id]/route";
+import { POST as POST_ACCESS } from "@/app/api/access/route";
+import { POST as POST_INTENT } from "@/app/api/intent/route";
+import { GET as GET_INTENT } from "@/app/api/intent/[id]/route";
+import { ACCESS_COOKIE_NAME } from "@/lib/access-session";
 
 const TEST_PASSWORD = "test-secret-123";
 const SUPABASE_URL = "http://127.0.0.1:54321";
@@ -12,7 +14,6 @@ const SERVICE_ROLE_KEY =
 let service: SupabaseClient;
 
 beforeAll(() => {
-  // Set env vars for the route handlers
   process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE_URL;
   process.env.SUPABASE_SERVICE_ROLE_KEY = SERVICE_ROLE_KEY;
   process.env.ACCESS_PASSWORD = TEST_PASSWORD;
@@ -27,14 +28,27 @@ beforeEach(async () => {
     .neq("id", "00000000-0000-0000-0000-000000000000");
 });
 
-function makePostRequest(
+function makeAccessRequest(body: Record<string, unknown>): NextRequest {
+  return new NextRequest("http://localhost:3000/api/access", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+function makeIntentPostRequest(
   body: Record<string, unknown>,
-  token?: string
+  cookie?: string
 ): NextRequest {
   const headers: Record<string, string> = {
     "content-type": "application/json",
   };
-  if (token) headers["x-access-token"] = token;
+
+  if (cookie) {
+    headers.cookie = cookie;
+  }
 
   return new NextRequest("http://localhost:3000/api/intent", {
     method: "POST",
@@ -43,9 +57,12 @@ function makePostRequest(
   });
 }
 
-function makeGetRequest(id: string, token?: string): NextRequest {
+function makeIntentGetRequest(id: string, cookie?: string): NextRequest {
   const headers: Record<string, string> = {};
-  if (token) headers["x-access-token"] = token;
+
+  if (cookie) {
+    headers.cookie = cookie;
+  }
 
   return new NextRequest(`http://localhost:3000/api/intent/${id}`, {
     method: "GET",
@@ -53,25 +70,53 @@ function makeGetRequest(id: string, token?: string): NextRequest {
   });
 }
 
-// ---------------------------------------------------------
-// POST /api/intent
-// ---------------------------------------------------------
-describe("POST /api/intent", () => {
+async function createAccessCookie(): Promise<string> {
+  const response = await POST_ACCESS(
+    makeAccessRequest({ password: TEST_PASSWORD })
+  );
+  const setCookie = response.headers.get("set-cookie");
+
+  expect(response.status).toBe(200);
+  expect(setCookie).toContain(`${ACCESS_COOKIE_NAME}=`);
+
+  return setCookie!.split(";")[0];
+}
+
+describe("POST /api/access", () => {
   it("returns 401 without password", async () => {
-    const res = await POST(makePostRequest({ intent_text: "test" }));
+    const res = await POST_ACCESS(makeAccessRequest({}));
     expect(res.status).toBe(401);
   });
 
   it("returns 401 with wrong password", async () => {
-    const res = await POST(
-      makePostRequest({ intent_text: "test" }, "wrong-password")
+    const res = await POST_ACCESS(
+      makeAccessRequest({ password: "wrong-password" })
     );
     expect(res.status).toBe(401);
   });
 
-  it("returns 200 with valid password and creates intent", async () => {
-    const res = await POST(
-      makePostRequest({ intent_text: "show me AI trends" }, TEST_PASSWORD)
+  it("returns 200 and sets an httpOnly session cookie with valid password", async () => {
+    const res = await POST_ACCESS(
+      makeAccessRequest({ password: TEST_PASSWORD })
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("set-cookie")).toContain(`${ACCESS_COOKIE_NAME}=`);
+    expect(res.headers.get("set-cookie")).toContain("HttpOnly");
+  });
+});
+
+describe("POST /api/intent", () => {
+  it("returns 401 without access cookie", async () => {
+    const res = await POST_INTENT(makeIntentPostRequest({ intent_text: "test" }));
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 200 with valid cookie and creates intent", async () => {
+    const cookie = await createAccessCookie();
+
+    const res = await POST_INTENT(
+      makeIntentPostRequest({ intent_text: "show me AI trends" }, cookie)
     );
     expect(res.status).toBe(200);
 
@@ -79,7 +124,6 @@ describe("POST /api/intent", () => {
     expect(json.id).toBeDefined();
     expect(typeof json.id).toBe("string");
 
-    // Verify row exists in DB with status pending
     const { data } = await service
       .from("user_intents")
       .select("*")
@@ -91,27 +135,31 @@ describe("POST /api/intent", () => {
   });
 
   it("returns 400 with empty intent_text", async () => {
-    const res = await POST(
-      makePostRequest({ intent_text: "" }, TEST_PASSWORD)
+    const cookie = await createAccessCookie();
+    const res = await POST_INTENT(
+      makeIntentPostRequest({ intent_text: "" }, cookie)
     );
     expect(res.status).toBe(400);
   });
 
   it("returns 400 with missing intent_text", async () => {
-    const res = await POST(makePostRequest({}, TEST_PASSWORD));
+    const cookie = await createAccessCookie();
+    const res = await POST_INTENT(makeIntentPostRequest({}, cookie));
     expect(res.status).toBe(400);
   });
 
   it("returns 400 with whitespace-only intent_text", async () => {
-    const res = await POST(
-      makePostRequest({ intent_text: "   " }, TEST_PASSWORD)
+    const cookie = await createAccessCookie();
+    const res = await POST_INTENT(
+      makeIntentPostRequest({ intent_text: "   " }, cookie)
     );
     expect(res.status).toBe(400);
   });
 
   it("trims whitespace from intent_text", async () => {
-    const res = await POST(
-      makePostRequest({ intent_text: "  show weather  " }, TEST_PASSWORD)
+    const cookie = await createAccessCookie();
+    const res = await POST_INTENT(
+      makeIntentPostRequest({ intent_text: "  show weather  " }, cookie)
     );
     const json = await res.json();
 
@@ -124,34 +172,32 @@ describe("POST /api/intent", () => {
   });
 });
 
-// ---------------------------------------------------------
-// GET /api/intent/[id]
-// ---------------------------------------------------------
 describe("GET /api/intent/[id]", () => {
-  it("returns 401 without password", async () => {
-    const res = await GET(makeGetRequest("some-id"), {
+  it("returns 401 without access cookie", async () => {
+    const res = await GET_INTENT(makeIntentGetRequest("some-id"), {
       params: Promise.resolve({ id: "some-id" }),
     });
     expect(res.status).toBe(401);
   });
 
   it("returns 404 for nonexistent id", async () => {
+    const cookie = await createAccessCookie();
     const fakeId = "00000000-0000-0000-0000-000000000001";
-    const res = await GET(makeGetRequest(fakeId, TEST_PASSWORD), {
+
+    const res = await GET_INTENT(makeIntentGetRequest(fakeId, cookie), {
       params: Promise.resolve({ id: fakeId }),
     });
     expect(res.status).toBe(404);
   });
 
   it("returns correct status for existing intent", async () => {
-    // Create an intent via POST
-    const postRes = await POST(
-      makePostRequest({ intent_text: "test intent" }, TEST_PASSWORD)
+    const cookie = await createAccessCookie();
+    const postRes = await POST_INTENT(
+      makeIntentPostRequest({ intent_text: "test intent" }, cookie)
     );
     const { id } = await postRes.json();
 
-    // Poll status
-    const res = await GET(makeGetRequest(id, TEST_PASSWORD), {
+    const res = await GET_INTENT(makeIntentGetRequest(id, cookie), {
       params: Promise.resolve({ id }),
     });
     expect(res.status).toBe(200);
@@ -162,19 +208,18 @@ describe("GET /api/intent/[id]", () => {
   });
 
   it("reflects status changes", async () => {
-    // Create an intent
-    const postRes = await POST(
-      makePostRequest({ intent_text: "test" }, TEST_PASSWORD)
+    const cookie = await createAccessCookie();
+    const postRes = await POST_INTENT(
+      makeIntentPostRequest({ intent_text: "test" }, cookie)
     );
     const { id } = await postRes.json();
 
-    // Simulate worker marking it as processing
     await service
       .from("user_intents")
       .update({ status: "processing" })
       .eq("id", id);
 
-    const res = await GET(makeGetRequest(id, TEST_PASSWORD), {
+    const res = await GET_INTENT(makeIntentGetRequest(id, cookie), {
       params: Promise.resolve({ id }),
     });
     const json = await res.json();
@@ -182,12 +227,13 @@ describe("GET /api/intent/[id]", () => {
   });
 
   it("only returns id and status, not intent_text or errors", async () => {
-    const postRes = await POST(
-      makePostRequest({ intent_text: "secret intent" }, TEST_PASSWORD)
+    const cookie = await createAccessCookie();
+    const postRes = await POST_INTENT(
+      makeIntentPostRequest({ intent_text: "secret intent" }, cookie)
     );
     const { id } = await postRes.json();
 
-    const res = await GET(makeGetRequest(id, TEST_PASSWORD), {
+    const res = await GET_INTENT(makeIntentGetRequest(id, cookie), {
       params: Promise.resolve({ id }),
     });
     const json = await res.json();
