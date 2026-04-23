@@ -11,6 +11,7 @@ An autonomous web engine that replaces traditional CMS interaction with a self-e
 A persistent text input fixed at the bottom of the viewport. This is the sole interface for user intent.
 
 - User types a goal: "show me AI industry trends this week"
+- For v0, the first interaction is gated by a shared access password that unlocks the session
 - Intent is queued in the database
 - Within minutes, the site evolves to reflect the request
 

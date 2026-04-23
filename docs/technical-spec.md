@@ -17,12 +17,14 @@
 │                                                   │
 │  ┌─────────────────────────────────────────────┐ │
 │  │              Magic Bar                        │ │
-│  │   (fixed bottom, submits via /api/intent)     │ │
+│  │  (fixed bottom, gated via /api/access,       │ │
+│  │        submits via /api/intent)              │ │
 │  └─────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────┘
             │                           │
-            │ POST /api/intent          │ Supabase Client SDK
-            │ GET  /api/intent/[id]     │ (Realtime on site_state only)
+            │ POST /api/access          │ Supabase Client SDK
+            │ POST /api/intent          │ (Realtime on site_state only)
+            │ GET  /api/intent/[id]     │
             ▼                           ▼
 ┌─────────────────────────────────────────────────┐
 │              Supabase Postgres                    │
@@ -170,31 +172,39 @@ A new version is produced whenever `site_state` changes — whether from intent 
 
 - Fixed-position input at viewport bottom using shadcn/ui `Input` + `Button`
 - On submit: POST to `/api/intent` server route (not direct DB insert)
-- Shows subtle confirmation via shadcn/ui `Sonner` toast ("Intent queued — site will evolve shortly")
-- Gated behind a session password for v0 (shadcn/ui `Dialog` modal on first visit)
+- Shows a subtle inline status message ("Intent queued — site will evolve shortly")
+- Gated behind a session password for v0 (modal on first visit)
 
 **Access gate (v0):**
 
-Intent submission goes through a Next.js API route (`/api/intent`) that validates a shared password before writing to the database. This prevents abuse via direct Supabase access — the anon key has no INSERT policy on `user_intents`.
+Intent submission goes through Next.js API routes. A dedicated access route validates a shared password and sets an httpOnly session cookie; intent submission and polling require that cookie. This prevents abuse via direct Supabase access — the anon key has no INSERT policy on `user_intents`.
 
 ```
-POST /api/intent
-Headers: { x-access-token: <password> }
-Body:    { intent_text: "show me AI trends" }
+POST /api/access
+Body: { password: "<shared password>" }
 
-→ Server validates token against ACCESS_PASSWORD env var
-→ If valid: inserts into user_intents using service role key, returns 200
+→ Server validates password against ACCESS_PASSWORD env var
+→ If valid: sets httpOnly session cookie, returns 200
 → If invalid: returns 401
+
+POST /api/intent
+Cookie: self_synth_access=<server-issued session cookie>
+Body:   { intent_text: "show me AI trends" }
+
+→ Server validates cookie
+→ If valid: inserts into user_intents using service role key, returns 200
+→ If invalid/missing: returns 401
 ```
 
-The frontend stores the password in a cookie after first successful validation.
+The browser never stores the raw password itself. The server stores access as an httpOnly session cookie after successful validation.
 
 **RLS policies:**
 
 The anon role has no access to `user_intents` at all — no SELECT, no INSERT. This prevents exposing intent text, error messages, or processing details to the public Supabase client. All intent operations go through server routes using the service role:
 
-- `POST /api/intent` — validates password, inserts intent, returns `{ id }`
-- `GET /api/intent/[id]` — validates password, returns `{ id, status }` only (for polling)
+- `POST /api/access` — validates password, sets session cookie
+- `POST /api/intent` — requires valid session cookie, inserts intent, returns `{ id }`
+- `GET /api/intent/[id]` — requires valid session cookie, returns `{ id, status }` only (for polling)
 
 The anon role can only SELECT on `site_state` (for Realtime subscriptions and initial page load). All other tables are service-role-only.
 
@@ -429,13 +439,15 @@ self-synthesizing-cms/
 ├── web/                        # Next.js app
 │   ├── app/
 │   │   ├── layout.tsx
-│   │   ├── page.tsx            # Site surface + magic bar
+│   │   ├── page.tsx            # Site surface + initial access state
 │   │   ├── globals.css
 │   │   └── api/
+│   │       ├── access/
+│   │       │   └── route.ts    # POST: validates password, sets session cookie
 │   │       └── intent/
-│   │           ├── route.ts    # POST: validates password, inserts intent
+│   │           ├── route.ts    # POST: requires access cookie, inserts intent
 │   │           └── [id]/
-│   │               └── route.ts  # GET: returns { id, status } for polling
+│   │               └── route.ts  # GET: requires access cookie, returns { id, status }
 │   ├── components/
 │   │   ├── magic-bar.tsx
 │   │   ├── access-gate.tsx     # Password modal for v0
@@ -469,8 +481,12 @@ self-synthesizing-cms/
 ## Realtime Flow
 
 ```
+User opens the site
+  → Access gate submits POST /api/access
+  → Server validates shared password, sets session cookie
+
 User types "show me AI trends"
-  → POST /api/intent (password validated server-side)
+  → POST /api/intent (session cookie validated server-side)
   → Server inserts into user_intents via service role
   → Returns { id }, user sees "Intent queued"
 
@@ -546,18 +562,21 @@ Set up all tables, indexes, RLS policies, and the version sequence.
 Intent submission and status polling routes with access gate.
 
 **Deliverables:**
-- `POST /api/intent` — validates password, inserts intent, returns `{ id }`
-- `GET /api/intent/[id]` — validates password, returns `{ id, status }`
+- `POST /api/access` — validates password, sets httpOnly session cookie
+- `POST /api/intent` — requires access cookie, inserts intent, returns `{ id }`
+- `GET /api/intent/[id]` — requires access cookie, returns `{ id, status }`
 - Supabase server client using service role key
 
 **Tests:**
-- POST without password → 401
-- POST with wrong password → 401
-- POST with valid password + intent text → 200, returns UUID, row exists in DB with status `pending`
+- POST `/api/access` without password → 401
+- POST `/api/access` with wrong password → 401
+- POST `/api/access` with valid password → 200, sets session cookie
+- POST `/api/intent` without cookie → 401
+- POST `/api/intent` with valid cookie + intent text → 200, returns UUID, row exists in DB with status `pending`
 - POST with empty intent text → 400
-- GET with valid id → returns correct status
+- GET with valid cookie + id → returns correct status
 - GET with nonexistent id → 404
-- GET without password → 401
+- GET without cookie → 401
 
 ---
 
@@ -697,15 +716,15 @@ Render content blocks from `site_state` with live updates and layout-aware trans
 User intent input with password protection.
 
 **Deliverables:**
-- `access-gate.tsx` — modal that prompts for password, stores in cookie on success
-- `magic-bar.tsx` — fixed-bottom input, POSTs to `/api/intent`, shows confirmation
+- `access-gate.tsx` — modal that prompts for password and unlocks the session via `POST /api/access`
+- `magic-bar.tsx` — fixed-bottom input, POSTs to `/api/intent`, shows inline confirmation/status
 - Status polling: after submit, polls `GET /api/intent/[id]` until completed/failed
 
 **Tests:**
 - Gate blocks magic bar until valid password entered
-- Invalid password shows error, does not store cookie
-- Valid password stores cookie, gate dismissed, persists across reload
-- Submit intent: POST fires with correct headers and body
+- Invalid password shows error, no session cookie issued
+- Valid password sets session cookie, gate dismissed, persists across reload
+- Submit intent: POST fires with correct body and cookie-backed auth
 - Confirmation message shown after successful submit
 - Polling: status transitions from `pending` → `processing` → `completed` reflected in UI
 - Empty input: submit button disabled or submission prevented
